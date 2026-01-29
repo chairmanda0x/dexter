@@ -139,6 +139,7 @@ export function ToolEndView({ tool, args, result, duration }: ToolEndViewProps) 
         if (Array.isArray(parsed.data)) {
           summary = `Received ${parsed.data.length} items`;
         } else if (typeof parsed.data === 'object') {
+	  console.error('DEBUG financial_search parsed.data:', JSON.stringify(parsed.data, null, 2));
           const keys = Object.keys(parsed.data).filter(k => !k.startsWith('_')); // Exclude _errors
           
           // Tool-specific summaries

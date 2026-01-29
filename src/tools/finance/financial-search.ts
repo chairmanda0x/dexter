@@ -19,37 +19,30 @@ import { getCompanyFacts } from './company_facts.js';
 
 // All finance tools available for routing
 const FINANCE_TOOLS: StructuredToolInterface[] = [
-  // Price Data
   getPriceSnapshot,
   getPrices,
   getCryptoPriceSnapshot,
   getCryptoPrices,
   getCryptoTickers,
-  // Fundamentals
   getIncomeStatements,
   getBalanceSheets,
   getCashFlowStatements,
   getAllFinancialStatements,
-  // Metrics & Estimates
   getFinancialMetricsSnapshot,
   getFinancialMetrics,
   getAnalystEstimates,
-  // SEC Filings
   getFilings,
   get10KFilingItems,
   get10QFilingItems,
   get8KFilingItems,
-  // Other Data
   getNews,
   getInsiderTrades,
   getSegmentedRevenues,
   getCompanyFacts,
 ];
 
-// Create a map for quick tool lookup by name
 const FINANCE_TOOL_MAP = new Map(FINANCE_TOOLS.map(t => [t.name, t]));
 
-// Build the router system prompt - simplified since LLM sees tool schemas
 function buildRouterPrompt(): string {
   return `You are a financial data routing assistant.
 Current date: ${getCurrentDate()}
@@ -65,35 +58,23 @@ Given a user's natural language query about financial data, call the appropriate
 2. **Date Inference**: Convert relative dates to YYYY-MM-DD format:
    - "last year" → start_date 1 year ago, end_date today
    - "last quarter" → start_date 3 months ago, end_date today
-   - "past 5 years" → start_date 5 years ago, end_date today
-   - "YTD" → start_date Jan 1 of current year, end_date today
 
 3. **Tool Selection**:
    - For "current" or "latest" data, use snapshot tools (get_price_snapshot, get_financial_metrics_snapshot)
-   - For "historical" or "over time" data, use date-range tools
-   - For P/E ratio, market cap, valuation metrics → get_financial_metrics_snapshot
    - For revenue, earnings, profitability → get_income_statements
    - For debt, assets, equity → get_balance_sheets
    - For cash flow, free cash flow → get_cash_flow_statements
-   - For comprehensive analysis → get_all_financial_statements
 
 4. **Efficiency**:
    - Prefer specific tools over general ones when possible
-   - Use get_all_financial_statements only when multiple statement types needed
-   - For comparisons between companies, call the same tool for each ticker
 
 Call the appropriate tool(s) now.`;
 }
 
-// Input schema for the financial_search tool
 const FinancialSearchInputSchema = z.object({
   query: z.string().describe('Natural language query about financial data'),
 });
 
-/**
- * Create a financial_search tool configured with the specified model.
- * Uses native LLM tool calling for routing queries to finance tools.
- */
 export function createFinancialSearch(model: string): DynamicStructuredTool {
   return new DynamicStructuredTool({
     name: 'financial_search',
@@ -108,30 +89,46 @@ export function createFinancialSearch(model: string): DynamicStructuredTool {
 - Cryptocurrency prices`,
     schema: FinancialSearchInputSchema,
     func: async (input) => {
-      // 1. Call LLM with finance tools bound (native tool calling)
-      const response = await callLlm(input.query, {
-        model,
-        systemPrompt: buildRouterPrompt(),
-        tools: FINANCE_TOOLS,
-      }) as AIMessage;
+      console.log('\n🔍 ========================================');
+      console.log('🔍 FINANCIAL_SEARCH called with query:', input.query);
+      console.log('🔍 Using model:', model);
+      console.log('🔍 Available tools:', FINANCE_TOOLS.map(t => t.name).join(', '));
+      console.log('🔍 ========================================\n');
 
-      // 2. Check for tool calls
+      let response: AIMessage;
+      try {
+        response = await callLlm(input.query, {
+          model,
+          systemPrompt: buildRouterPrompt(),
+          tools: FINANCE_TOOLS,
+        }) as AIMessage;
+        console.log('📤 LLM Response tool_calls:', JSON.stringify(response?.tool_calls, null, 2));
+      } catch (error) {
+        console.error('❌ LLM call failed:', error);
+        return formatToolResult({ error: `LLM call failed: ${error}` }, []);
+      }
+
       const toolCalls = response.tool_calls as ToolCall[];
+      console.log('🔧 Number of tool calls:', toolCalls?.length ?? 0);
+
       if (!toolCalls || toolCalls.length === 0) {
+        console.log('❌ No tool calls returned from LLM!');
         return formatToolResult({ error: 'No tools selected for query' }, []);
       }
 
-      // 3. Execute tool calls in parallel
+      console.log('⚙️ Executing', toolCalls.length, 'tool calls...');
       const results = await Promise.all(
         toolCalls.map(async (tc) => {
+          console.log(`⚙️ Executing tool: ${tc.name} with args:`, JSON.stringify(tc.args));
           try {
             const tool = FINANCE_TOOL_MAP.get(tc.name);
             if (!tool) {
               throw new Error(`Tool '${tc.name}' not found`);
             }
             const rawResult = await tool.invoke(tc.args);
-            const result = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
-            const parsed = JSON.parse(result);
+            const resultStr = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
+            console.log(`✅ Tool ${tc.name} result preview:`, resultStr.substring(0, 300));
+            const parsed = JSON.parse(resultStr);
             return {
               tool: tc.name,
               args: tc.args,
@@ -140,6 +137,7 @@ export function createFinancialSearch(model: string): DynamicStructuredTool {
               error: null,
             };
           } catch (error) {
+            console.error(`❌ Tool ${tc.name} failed:`, error);
             return {
               tool: tc.name,
               args: tc.args,
@@ -151,24 +149,19 @@ export function createFinancialSearch(model: string): DynamicStructuredTool {
         })
       );
 
-      // 4. Combine results
       const successfulResults = results.filter((r) => r.error === null);
       const failedResults = results.filter((r) => r.error !== null);
+      console.log(`📊 Results: ${successfulResults.length} successful, ${failedResults.length} failed`);
 
-      // Collect all source URLs
       const allUrls = results.flatMap((r) => r.sourceUrls);
-
-      // Build combined data structure
       const combinedData: Record<string, unknown> = {};
 
       for (const result of successfulResults) {
-        // Use tool name as key, or tool_ticker for multiple calls to same tool
         const ticker = (result.args as Record<string, unknown>).ticker as string | undefined;
         const key = ticker ? `${result.tool}_${ticker}` : result.tool;
         combinedData[key] = result.data;
       }
 
-      // Add errors if any
       if (failedResults.length > 0) {
         combinedData._errors = failedResults.map((r) => ({
           tool: r.tool,
@@ -177,6 +170,7 @@ export function createFinancialSearch(model: string): DynamicStructuredTool {
         }));
       }
 
+      console.log('📊 Final data keys:', Object.keys(combinedData));
       return formatToolResult(combinedData, allUrls);
     },
   });
